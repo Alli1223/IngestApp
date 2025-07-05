@@ -14,7 +14,8 @@ pub struct IngestApp {
     destination_input: String,
     progress: Arc<Mutex<ProgressInfo>>, // shared progress information
     logs: Arc<Mutex<Vec<String>>>,
-    pending_copy: Arc<Mutex<Option<CopyRequest>>>,
+    pending_copy: Arc<Mutex<Vec<CopyRequest>>>,
+    selected_index: usize,
     preview_texture: Option<egui::TextureHandle>,
     last_preview_path: Option<PathBuf>,
 }
@@ -24,7 +25,7 @@ impl IngestApp {
         config: Config,
         progress: Arc<Mutex<ProgressInfo>>,
         logs: Arc<Mutex<Vec<String>>>,
-        pending_copy: Arc<Mutex<Option<CopyRequest>>>,
+        pending_copy: Arc<Mutex<Vec<CopyRequest>>>,
     ) -> Self {
         let destination_input = config
             .destination
@@ -37,6 +38,7 @@ impl IngestApp {
             progress,
             logs,
             pending_copy,
+            selected_index: 0,
             preview_texture: None,
             last_preview_path: None,
         }
@@ -96,44 +98,59 @@ impl App for IngestApp {
             });
         });
 
-        if let Some(request) = self.pending_copy.lock().unwrap().clone() {
-            let mut start_copy = false;
-            egui::Window::new("Confirm Copy")
-                .collapsible(false)
-                .show(ctx, |ui| {
-                    ui.label(format!("Copy from: {}", request.src.display()));
-                    ui.label(format!("Copy to: {}", request.dest.display()));
-                    ui.label(format!("Files to copy: {}", request.file_count));
-                    ui.horizontal(|ui| {
-                        if ui.button("Start").clicked() {
-                            start_copy = true;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            self.pending_copy.lock().unwrap().take();
-                        }
-                    });
-                });
-
-            if start_copy {
-                self.pending_copy.lock().unwrap().take();
-                self.logs
-                    .lock()
-                    .unwrap()
-                    .push(format!("Starting copy from {}", request.src.display()));
-                {
-                    let mut p = self.progress.lock().unwrap();
-                    p.message = format!("Copying from {}...", request.src.display());
+        let mut start_copy: Option<CopyRequest> = None;
+        {
+            let mut pending = self.pending_copy.lock().unwrap();
+            if !pending.is_empty() {
+                if self.selected_index >= pending.len() {
+                    self.selected_index = 0;
                 }
-                let progress = self.progress.clone();
-                let logs = self.logs.clone();
-                thread::spawn(move || {
-                    if let Err(e) = copy_media(&request.src, &request.dest, progress.clone(), logs.clone()) {
-                        progress.lock().unwrap().message = format!("Error copying: {}", e);
-                    } else {
-                        progress.lock().unwrap().message = String::from("Copy completed");
-                    }
-                });
+                egui::Window::new("Select Drive")
+                    .collapsible(false)
+                    .show(ctx, |ui| {
+                        for (i, req) in pending.iter().enumerate() {
+                            ui.radio_value(
+                                &mut self.selected_index,
+                                i,
+                                format!("{} -> {}", req.src.display(), req.dest.display()),
+                            );
+                        }
+                        ui.horizontal(|ui| {
+                            if ui.button("Go").clicked() {
+                                start_copy = Some(pending.remove(self.selected_index));
+                                if self.selected_index >= pending.len() {
+                                    self.selected_index = 0;
+                                }
+                            }
+                            if ui.button("Cancel").clicked() {
+                                pending.remove(self.selected_index);
+                                if self.selected_index >= pending.len() {
+                                    self.selected_index = 0;
+                                }
+                            }
+                        });
+                    });
             }
+        }
+
+        if let Some(request) = start_copy {
+            self.logs
+                .lock()
+                .unwrap()
+                .push(format!("Starting copy from {}", request.src.display()));
+            {
+                let mut p = self.progress.lock().unwrap();
+                p.message = format!("Copying from {}...", request.src.display());
+            }
+            let progress = self.progress.clone();
+            let logs = self.logs.clone();
+            thread::spawn(move || {
+                if let Err(e) = copy_media(&request.src, &request.dest, progress.clone(), logs.clone()) {
+                    progress.lock().unwrap().message = format!("Error copying: {}", e);
+                } else {
+                    progress.lock().unwrap().message = String::from("Copy completed");
+                }
+            });
         }
     }
 }

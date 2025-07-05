@@ -59,7 +59,11 @@ pub fn copy_media(
         TransitProcessResult::ContinueOrAbort
     })
     .map(|_| ())
-    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    // Record destination path on the source drive for future runs
+    let ingest_file = src.join("ingest.txt");
+    let _ = fs::write(ingest_file, dest.to_string_lossy().as_ref());
+    Ok(())
 }
 
 fn count_files(path: &Path) -> usize {
@@ -88,7 +92,7 @@ fn main() -> eframe::Result<()> {
     let logs: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let logs_thread = logs.clone();
     let dest = config.destination.clone();
-    let pending_copy: Arc<Mutex<Option<CopyRequest>>> = Arc::new(Mutex::new(None));
+    let pending_copy: Arc<Mutex<Vec<CopyRequest>>> = Arc::new(Mutex::new(Vec::new()));
     let pending_copy_watch = pending_copy.clone();
 
     // Spawn background thread to watch for new drives
@@ -107,7 +111,10 @@ fn main() -> eframe::Result<()> {
 
             // check for new mount points
             for mount in current.difference(&known) {
-                if let Some(dest_path) = &dest {
+                let ingest_path = mount.join("ingest.txt");
+                let dest_from_file = fs::read_to_string(&ingest_path).ok().map(|s| PathBuf::from(s.trim()));
+                let dest_path = dest_from_file.or_else(|| dest.clone());
+                if let Some(dest_path) = dest_path {
                     let file_count = count_files(mount);
                     {
                         let mut p = progress_clone.lock().unwrap();
@@ -117,9 +124,9 @@ fn main() -> eframe::Result<()> {
                         .lock()
                         .unwrap()
                         .push(format!("Drive {} detected", mount.display()));
-                    *pending_copy_watch.lock().unwrap() = Some(CopyRequest {
+                    pending_copy_watch.lock().unwrap().push(CopyRequest {
                         src: mount.clone(),
-                        dest: dest_path.clone(),
+                        dest: dest_path,
                         file_count,
                     });
                 }
