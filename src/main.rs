@@ -13,7 +13,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use sysinfo::{Disks, System};
+use sysinfo::Disks;
 use std::thread;
 use std::time::Instant;
 use std::fs;
@@ -84,6 +84,59 @@ fn count_files(path: &Path) -> usize {
     count
 }
 
+pub fn scan_for_drives(
+    dest: &Option<PathBuf>,
+    progress: &Arc<Mutex<ProgressInfo>>,
+    logs: &Arc<Mutex<Vec<String>>>,
+    pending_copy: &Arc<Mutex<Vec<CopyRequest>>>,
+    known: &Arc<Mutex<HashSet<PathBuf>>>,
+) {
+    let disks = Disks::new_with_refreshed_list();
+
+    let mut current = HashSet::new();
+    for disk in disks.list() {
+        if let Some(mount) = disk.mount_point().to_str() {
+            current.insert(PathBuf::from(mount));
+        }
+    }
+    if let Ok(user) = std::env::var("USER") {
+        let media_path = PathBuf::from(format!("/media/{}", user));
+        if let Ok(entries) = fs::read_dir(media_path) {
+            for entry in entries.flatten() {
+                if entry.path().is_dir() {
+                    current.insert(entry.path());
+                }
+            }
+        }
+    }
+
+    let mut known_guard = known.lock().unwrap();
+    for mount in current.difference(&*known_guard) {
+        let ingest_path = mount.join("ingest.txt");
+        let dest_from_file = fs::read_to_string(&ingest_path)
+            .ok()
+            .map(|s| PathBuf::from(s.trim()));
+        let dest_path = dest_from_file.or_else(|| dest.clone());
+        if let Some(dest_path) = dest_path {
+            let file_count = count_files(mount);
+            {
+                let mut p = progress.lock().unwrap();
+                p.message = format!("Drive {} detected", mount.display());
+            }
+            logs.lock()
+                .unwrap()
+                .push(format!("Drive {} detected", mount.display()));
+            pending_copy.lock().unwrap().push(CopyRequest {
+                src: mount.clone(),
+                dest: dest_path,
+                file_count,
+            });
+        }
+    }
+
+    *known_guard = current;
+}
+
 fn main() -> eframe::Result<()> {
     let config = Config::load();
     let progress = Arc::new(Mutex::new(ProgressInfo::default()));
@@ -94,50 +147,23 @@ fn main() -> eframe::Result<()> {
     let dest = config.destination.clone();
     let pending_copy: Arc<Mutex<Vec<CopyRequest>>> = Arc::new(Mutex::new(Vec::new()));
     let pending_copy_watch = pending_copy.clone();
+    let known: Arc<Mutex<HashSet<PathBuf>>> = Arc::new(Mutex::new(HashSet::new()));
+    let known_thread = known.clone();
 
     // Spawn background thread to watch for new drives
     thread::spawn(move || {
-        let mut _system = System::new();
-        let mut disks = Disks::new_with_refreshed_list();
-        let mut known: HashSet<PathBuf> = HashSet::new();
         loop {
-            disks.refresh(true);
-            let mut current = HashSet::new();
-            for disk in disks.list() {
-                if let Some(mount) = disk.mount_point().to_str() {
-                    current.insert(PathBuf::from(mount));
-                }
-            }
-
-            // check for new mount points
-            for mount in current.difference(&known) {
-                let ingest_path = mount.join("ingest.txt");
-                let dest_from_file = fs::read_to_string(&ingest_path).ok().map(|s| PathBuf::from(s.trim()));
-                let dest_path = dest_from_file.or_else(|| dest.clone());
-                if let Some(dest_path) = dest_path {
-                    let file_count = count_files(mount);
-                    {
-                        let mut p = progress_clone.lock().unwrap();
-                        p.message = format!("Drive {} detected", mount.display());
-                    }
-                    logs_thread
-                        .lock()
-                        .unwrap()
-                        .push(format!("Drive {} detected", mount.display()));
-                    pending_copy_watch.lock().unwrap().push(CopyRequest {
-                        src: mount.clone(),
-                        dest: dest_path,
-                        file_count,
-                    });
-                }
-            }
-
-            known = current;
+            scan_for_drives(
+                &dest,
+                &progress_clone,
+                &logs_thread,
+                &pending_copy_watch,
+                &known_thread,
+            );
             thread::sleep(Duration::from_secs(5));
         }
     });
-
-    let app = IngestApp::new(config, progress, logs, pending_copy);
+    let app = IngestApp::new(config, progress, logs, pending_copy, known);
     let native_options = eframe::NativeOptions::default();
     eframe::run_native(
         "Ingest App",
