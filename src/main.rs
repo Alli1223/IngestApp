@@ -1,10 +1,12 @@
 mod app;
 mod config;
 mod progress;
+mod copy_request;
 
 use crate::app::IngestApp;
 use crate::config::Config;
 use crate::progress::ProgressInfo;
+use crate::copy_request::CopyRequest;
 use eframe;
 use fs_extra::dir::{copy_with_progress, CopyOptions, TransitProcessResult};
 use std::collections::HashSet;
@@ -14,8 +16,10 @@ use std::time::Duration;
 use sysinfo::{Disks, System};
 use std::thread;
 use std::time::Instant;
+use std::fs;
+use std::path::Path;
 
-fn copy_media(
+pub fn copy_media(
     src: &PathBuf,
     dest: &PathBuf,
     progress: Arc<Mutex<ProgressInfo>>,
@@ -58,14 +62,34 @@ fn copy_media(
     .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
 }
 
+fn count_files(path: &Path) -> usize {
+    fn helper(p: &Path, count: &mut usize) {
+        if let Ok(entries) = fs::read_dir(p) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    helper(&path, count);
+                } else {
+                    *count += 1;
+                }
+            }
+        }
+    }
+    let mut count = 0usize;
+    helper(path, &mut count);
+    count
+}
+
 fn main() -> eframe::Result<()> {
     let config = Config::load();
     let progress = Arc::new(Mutex::new(ProgressInfo::default()));
     progress.lock().unwrap().message = "Waiting for drive...".to_string();
     let progress_clone = progress.clone();
     let logs: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-    let logs_clone = logs.clone();
+    let logs_thread = logs.clone();
     let dest = config.destination.clone();
+    let pending_copy: Arc<Mutex<Option<CopyRequest>>> = Arc::new(Mutex::new(None));
+    let pending_copy_watch = pending_copy.clone();
 
     // Spawn background thread to watch for new drives
     thread::spawn(move || {
@@ -84,16 +108,20 @@ fn main() -> eframe::Result<()> {
             // check for new mount points
             for mount in current.difference(&known) {
                 if let Some(dest_path) = &dest {
+                    let file_count = count_files(mount);
                     {
                         let mut p = progress_clone.lock().unwrap();
-                        p.message = format!("Copying from {}...", mount.display());
+                        p.message = format!("Drive {} detected", mount.display());
                     }
-                    let src = mount.clone();
-                    if let Err(e) = copy_media(&src, dest_path, progress_clone.clone(), logs_clone.clone()) {
-                        progress_clone.lock().unwrap().message = format!("Error copying: {}", e);
-                    } else {
-                        progress_clone.lock().unwrap().message = String::from("Copy completed");
-                    }
+                    logs_thread
+                        .lock()
+                        .unwrap()
+                        .push(format!("Drive {} detected", mount.display()));
+                    *pending_copy_watch.lock().unwrap() = Some(CopyRequest {
+                        src: mount.clone(),
+                        dest: dest_path.clone(),
+                        file_count,
+                    });
                 }
             }
 
@@ -102,7 +130,7 @@ fn main() -> eframe::Result<()> {
         }
     });
 
-    let app = IngestApp::new(config, progress, logs);
+    let app = IngestApp::new(config, progress, logs, pending_copy);
     let native_options = eframe::NativeOptions::default();
     eframe::run_native(
         "Ingest App",
