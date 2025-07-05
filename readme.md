@@ -25,7 +25,8 @@ The GUI allows selecting a destination folder. Once set, any newly mounted drive
 
 ### Common tasks
 
-Install development tools (like `rustfmt` and `clippy`):
+Install development tools (like `rustfmt` and `clippy`).
+These require [`rustup`](https://rustup.rs) to be installed:
 
 ```
 make install-deps

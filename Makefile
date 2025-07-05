@@ -1,5 +1,10 @@
 install-deps:
-	rustup component add rustfmt clippy
+	@# Install rustfmt and clippy if rustup is available
+	@if command -v rustup >/dev/null 2>&1; then \
+	rustup component add rustfmt clippy; \
+	else \
+	echo "rustup not found. Please install rustup from https://rustup.rs"; \
+	fi
 
 fmt:
 	cargo fmt
