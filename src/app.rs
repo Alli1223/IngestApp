@@ -3,11 +3,13 @@ use crate::progress::ProgressInfo;
 use eframe::egui::{self, CentralPanel, Context, TextEdit, TopBottomPanel};
 use eframe::App;
 use image::io::Reader as ImageReader;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use crate::copy_request::CopyRequest;
 use crate::copy_media;
+use std::process::Command;
 
 pub struct IngestApp {
     config: Config,
@@ -15,6 +17,7 @@ pub struct IngestApp {
     progress: Arc<Mutex<ProgressInfo>>, // shared progress information
     logs: Arc<Mutex<Vec<String>>>,
     pending_copy: Arc<Mutex<Vec<CopyRequest>>>,
+    known: Arc<Mutex<HashSet<PathBuf>>>,
     selected_index: usize,
     preview_texture: Option<egui::TextureHandle>,
     last_preview_path: Option<PathBuf>,
@@ -26,6 +29,7 @@ impl IngestApp {
         progress: Arc<Mutex<ProgressInfo>>,
         logs: Arc<Mutex<Vec<String>>>,
         pending_copy: Arc<Mutex<Vec<CopyRequest>>>,
+        known: Arc<Mutex<HashSet<PathBuf>>>,
     ) -> Self {
         let destination_input = config
             .destination
@@ -38,6 +42,7 @@ impl IngestApp {
             progress,
             logs,
             pending_copy,
+            known,
             selected_index: 0,
             preview_texture: None,
             last_preview_path: None,
@@ -57,13 +62,25 @@ impl App for IngestApp {
                         self.config.save();
                     }
                 }
+                ui.add_space(10.0);
+                if ui.button("Refresh").clicked() {
+                    crate::scan_for_drives(
+                        &self.config.destination,
+                        &self.progress,
+                        &self.logs,
+                        &self.pending_copy,
+                        &self.known,
+                    );
+                }
             });
         });
 
         CentralPanel::default().show(ctx, |ui| {
             let progress = self.progress.lock().unwrap().clone();
             ui.label(progress.message.clone());
+            ui.add_space(5.0);
             ui.add(egui::ProgressBar::new(progress.total_progress()).show_percentage());
+            ui.add_space(5.0);
             ui.add(egui::ProgressBar::new(progress.file_progress()).show_percentage());
             ui.label(format!("Speed: {:.2} MB/s", progress.speed / 1_048_576.0));
 
@@ -86,6 +103,17 @@ impl App for IngestApp {
                     let size = tex.size_vec2();
                     let scale = (max / size.x).min(max / size.y).min(1.0);
                     ui.add(egui::Image::from_texture(tex).fit_to_exact_size(size * scale));
+                }
+            }
+
+            if Self::sd_reader_present() {
+                let mounts = Self::mounted_media_dirs();
+                if mounts.is_empty() {
+                    for dev in Self::list_unmounted_devices() {
+                        if ui.button(format!("Mount {}", dev)).clicked() {
+                            Self::mount_device(&dev, &self.logs);
+                        }
+                    }
                 }
             }
 
@@ -151,6 +179,62 @@ impl App for IngestApp {
                     progress.lock().unwrap().message = String::from("Copy completed");
                 }
             });
+        }
+    }
+}
+
+impl IngestApp {
+    fn sd_reader_present() -> bool {
+        if let Ok(out) = Command::new("lsusb").output() {
+            let text = String::from_utf8_lossy(&out.stdout).to_lowercase();
+            text.contains("05e3:0743") || text.contains("cardreader")
+        } else {
+            false
+        }
+    }
+
+    fn list_unmounted_devices() -> Vec<String> {
+        if let Ok(out) = Command::new("lsblk")
+            .args(&["-rnpo", "NAME,MOUNTPOINT"])
+            .output()
+        {
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter_map(|l| {
+                    let mut p = l.split_whitespace();
+                    let name = p.next()?;
+                    if p.next().unwrap_or("").is_empty() {
+                        Some(name.to_string())
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn mounted_media_dirs() -> Vec<PathBuf> {
+        if let Ok(user) = std::env::var("USER") {
+            let base = PathBuf::from(format!("/media/{}", user));
+            if let Ok(entries) = std::fs::read_dir(base) {
+                return entries.flatten().map(|e| e.path()).collect();
+            }
+        }
+        Vec::new()
+    }
+
+    fn mount_device(dev: &str, logs: &Arc<Mutex<Vec<String>>>) {
+        if let Ok(out) = Command::new("udisksctl")
+            .args(&["mount", "-b", dev])
+            .output()
+        {
+            logs.lock()
+                .unwrap()
+                .push(format!("Mounted {}: {}", dev, String::from_utf8_lossy(&out.stdout)));
+        } else {
+            logs.lock().unwrap().push(format!("Failed to mount {}", dev));
         }
     }
 }
